@@ -26,9 +26,12 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .tb-btn { background: var(--border); border: none; color: var(--text); border-radius: var(--radius); padding: .35rem .75rem; font-size: .78rem; cursor: pointer; white-space: nowrap; flex-shrink: 0; }
 .tb-btn:hover { background: #2d333b; }
 
-#viewport-wrap { flex: 1; position: relative; background: #000; touch-action: none; user-select: none; }
-#viewport { position: absolute; inset: 0; }
-#viewport canvas { display: block; }
+#viewport-wrap { flex: 1; position: relative; background: #000; touch-action: none; user-select: none; overflow: hidden; }
+#canvas {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  image-rendering: pixelated;  /* sin filtro al upscale — más fiel al CT */
+  display: block;
+}
 
 #overlay {
   position: absolute; top: .5rem; right: .75rem; pointer-events: none;

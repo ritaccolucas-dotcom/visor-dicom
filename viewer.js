@@ -1,6 +1,15 @@
-// Visor DICOM v1 — stack legacy cornerstone-core, sin bundler.
-// Pipeline: ?zip=<proxy URL> → fetch zip → JSZip extract .dcm
-//        → registramos cada .dcm como imageId wadouri:// → cornerstone display.
+// Visor DICOM v1 — render directo a canvas con dicom-parser.
+//
+// Pipeline:
+//   ?zip=<proxy URL> → fetch zip → JSZip extract .dcm
+//   → para cada uno: dicomParser.parseDicom() → extraemos pixel data
+//   → ordenamos por InstanceNumber → renderizamos al canvas aplicando
+//     windowing.
+//
+// Soporta DICOM uncompressed (transfer syntax Implicit/Explicit Little
+// Endian), que es lo que exporta Mimics/Horos/MicroDicom y los CTs de
+// hospital normales. Compressed (JPEG/JPEG2000) NO — para esos hace
+// falta una lib de decompresión.
 
 const PRESETS = [
   { label: 'Bone',         ww: 1500, wc: 400  },
@@ -11,9 +20,10 @@ const PRESETS = [
 
 const state = {
   presetIdx: 0,
-  imageIds: [],
+  slices: [],          // array de {rows, cols, pixelData, slope, intercept, instance}
   currentIdx: 0,
-  element: null,
+  canvas: null,
+  ctx: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -52,31 +62,16 @@ function applyPreset() {
   const p = PRESETS[state.presetIdx];
   $('preset-btn').textContent = p.label;
   $('wl-label').textContent = `W ${p.ww} · L ${p.wc}`;
-  if (!state.element) return;
-  const viewport = cornerstone.getViewport(state.element);
-  if (!viewport) return;
-  viewport.voi.windowWidth = p.ww;
-  viewport.voi.windowCenter = p.wc;
-  cornerstone.setViewport(state.element, viewport);
+  renderCurrent();
 }
 
 function setSlice(idx) {
-  if (!state.imageIds.length) return;
-  idx = Math.max(0, Math.min(state.imageIds.length - 1, idx));
+  if (!state.slices.length) return;
+  idx = Math.max(0, Math.min(state.slices.length - 1, idx));
   state.currentIdx = idx;
-  cornerstone.loadImage(state.imageIds[idx]).then((image) => {
-    cornerstone.displayImage(state.element, image);
-    // Reaplicamos windowing del preset actual.
-    const p = PRESETS[state.presetIdx];
-    const viewport = cornerstone.getViewport(state.element);
-    viewport.voi.windowWidth = p.ww;
-    viewport.voi.windowCenter = p.wc;
-    cornerstone.setViewport(state.element, viewport);
-  }).catch((e) => {
-    console.error('loadImage failed', e);
-  });
-  $('slice-label').textContent = `${idx + 1} / ${state.imageIds.length}`;
+  $('slice-label').textContent = `${idx + 1} / ${state.slices.length}`;
   $('slice-input').value = idx;
+  renderCurrent();
 }
 
 // ─── Drive zip download with progress ─────────────────────────────
@@ -93,7 +88,7 @@ async function downloadZip(url) {
     if (done) break;
     chunks.push(value);
     received += value.length;
-    const pct = total ? 5 + (received / total) * 55 : 30;
+    const pct = total ? 5 + (received / total) * 45 : 30;
     const mb = (received / 1024 / 1024).toFixed(1);
     const totalMb = total ? ` / ${(total / 1024 / 1024).toFixed(0)} MB` : '';
     setLoading('Descargando zip…', pct, `${mb} MB${totalMb}`);
@@ -101,132 +96,117 @@ async function downloadZip(url) {
   return new Blob(chunks);
 }
 
-// ─── Unzip + collect .dcm files ───────────────────────────────────
+// ─── Unzip + collect DICOM (magic-checked) ────────────────────────
 async function extractDicoms(zipBlob) {
-  setLoading('Descomprimiendo…', 62, '');
+  setLoading('Descomprimiendo…', 52, '');
   const zip = await JSZip.loadAsync(zipBlob);
 
-  // Filtramos por extensión + por magic number DICM al offset 128.
   const candidates = [];
   zip.forEach((path, entry) => {
     if (entry.dir) return;
     const lower = path.toLowerCase();
-    // Ignoramos archivos de macOS, READMEs, etc.
     if (lower.includes('__macosx') || lower.endsWith('.ds_store')) return;
     candidates.push(entry);
   });
+  if (!candidates.length) throw new Error('El zip está vacío');
 
-  if (!candidates.length) {
-    throw new Error('El zip está vacío');
-  }
-
-  setLoading(`Leyendo ${candidates.length} archivos…`, 65, '');
-  const dcmFiles = [];
+  setLoading(`Leyendo ${candidates.length} archivos…`, 55, '');
+  const dcmBuffers = [];
   for (let i = 0; i < candidates.length; i++) {
-    const entry = candidates[i];
-    const buf = await entry.async('arraybuffer');
-    // Magic check: bytes 128-131 deben ser "DICM" para DICOM Part 10.
+    const buf = await candidates[i].async('arraybuffer');
+    // DICOM Part 10: magic "DICM" en bytes 128..131.
     if (buf.byteLength > 132) {
-      const sig = String.fromCharCode(
-        ...new Uint8Array(buf, 128, 4),
-      );
-      if (sig === 'DICM') {
-        dcmFiles.push({ name: entry.name, buf });
-      }
+      const sig = String.fromCharCode(...new Uint8Array(buf, 128, 4));
+      if (sig === 'DICM') dcmBuffers.push({ name: candidates[i].name, buf });
     }
     if (i % 10 === 0) {
-      const pct = 65 + ((i + 1) / candidates.length) * 25;
-      setLoading(`Leyendo archivos…`, pct, `${i + 1}/${candidates.length}`);
+      const pct = 55 + ((i + 1) / candidates.length) * 15;
+      setLoading('Leyendo archivos…', pct, `${i + 1}/${candidates.length}`);
     }
   }
-
-  if (!dcmFiles.length) {
-    throw new Error(`Ningún archivo en el zip es DICOM (revisados ${candidates.length})`);
+  if (!dcmBuffers.length) {
+    throw new Error(`Ningún archivo es DICOM (revisados ${candidates.length})`);
   }
-  return dcmFiles;
+  return dcmBuffers;
 }
 
-// ─── Cornerstone init ──────────────────────────────────────────────
-function initCornerstone() {
-  // Wire external deps que el image loader espera.
-  cornerstoneWADOImageLoader.external.cornerstone = cornerstone;
-  cornerstoneWADOImageLoader.external.dicomParser = dicomParser;
-  // Configuración mínima — sin web workers para evitar problemas de path.
-  cornerstoneWADOImageLoader.configure({
-    useWebWorkers: false,
-    decodeConfig: { convertFloatPixelDataToInt: false },
-  });
-}
+// ─── DICOM parse + pixel extract ──────────────────────────────────
+function parseSlice(buf) {
+  const ds = dicomParser.parseDicom(new Uint8Array(buf));
 
-// Convierte cada DICOM en blob URL y arma imageIds con scheme wadouri:
-function registerImageIds(dcmFiles) {
-  return dcmFiles.map(({ buf }) => {
-    const blob = new Blob([buf], { type: 'application/dicom' });
-    const url = URL.createObjectURL(blob);
-    return `wadouri:${url}`;
-  });
-}
+  const rows = ds.uint16('x00280010') || 0;
+  const cols = ds.uint16('x00280011') || 0;
+  const bitsAllocated = ds.uint16('x00280100') || 16;
+  const pixelRepresentation = ds.uint16('x00280103') || 0;  // 0 unsigned, 1 signed
+  const samplesPerPixel = ds.uint16('x00280002') || 1;
+  const slope = parseFloat(ds.string('x00281053')) || 1;
+  const intercept = parseFloat(ds.string('x00281052')) || 0;
+  const instance = parseInt(ds.string('x00200013'), 10) || 0;
+  const position = ds.string('x00200032');  // ImagePositionPatient
+  // Para sortear si InstanceNumber no está, podemos usar Z de position.
+  let zPos = 0;
+  if (position) {
+    const parts = position.split('\\');
+    if (parts.length === 3) zPos = parseFloat(parts[2]);
+  }
 
-// Ordena los imageIds por InstanceNumber leyendo metadata de cada uno.
-async function sortByInstanceNumber(imageIds) {
-  const withMeta = await Promise.all(imageIds.map(async (id) => {
-    try {
-      const image = await cornerstone.loadAndCacheImage(id);
-      const ds = image.data;
-      // InstanceNumber está en (0020,0013).
-      const inst = ds?.intString?.('x00200013') ?? 0;
-      return { id, inst };
-    } catch {
-      return { id, inst: 0 };
+  const pixelDataElement = ds.elements.x7fe00010;
+  if (!pixelDataElement) throw new Error('No tiene PixelData');
+
+  let pixelData;
+  if (bitsAllocated === 16) {
+    if (pixelRepresentation === 1) {
+      pixelData = new Int16Array(buf, pixelDataElement.dataOffset, pixelDataElement.length / 2);
+    } else {
+      pixelData = new Uint16Array(buf, pixelDataElement.dataOffset, pixelDataElement.length / 2);
     }
-  }));
-  withMeta.sort((a, b) => a.inst - b.inst);
-  return withMeta.map((x) => x.id);
-}
-
-async function renderFromDicoms(dcmFiles) {
-  setLoading('Inicializando visor…', 92, '');
-  initCornerstone();
-  state.element = $('viewport');
-  cornerstone.enable(state.element);
-
-  setLoading('Indexando cortes…', 95, '');
-  const rawIds = registerImageIds(dcmFiles);
-  state.imageIds = await sortByInstanceNumber(rawIds);
-
-  $('slice-input').max = state.imageIds.length - 1;
-  $('slice-input').disabled = false;
-  $('slice-input').addEventListener('input', (e) => setSlice(+e.target.value));
-
-  // Scroll de slices con rueda + touch swipe vertical.
-  state.element.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    const dir = e.deltaY > 0 ? 1 : -1;
-    setSlice(state.currentIdx + dir);
-  }, { passive: false });
-
-  let touchStartY = null;
-  state.element.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 1) touchStartY = e.touches[0].clientY;
-  }, { passive: true });
-  state.element.addEventListener('touchmove', (e) => {
-    if (touchStartY == null) return;
-    const dy = touchStartY - e.touches[0].clientY;
-    if (Math.abs(dy) > 18) {
-      setSlice(state.currentIdx + Math.sign(dy));
-      touchStartY = e.touches[0].clientY;
+  } else if (bitsAllocated === 8) {
+    if (pixelRepresentation === 1) {
+      pixelData = new Int8Array(buf, pixelDataElement.dataOffset, pixelDataElement.length);
+    } else {
+      pixelData = new Uint8Array(buf, pixelDataElement.dataOffset, pixelDataElement.length);
     }
-  }, { passive: true });
+  } else {
+    throw new Error(`bitsAllocated=${bitsAllocated} no soportado`);
+  }
 
-  $('preset-btn').style.display = '';
-  $('title').textContent = `DICOM · ${state.imageIds.length} cortes`;
-  applyPreset();
-  setSlice(Math.floor(state.imageIds.length / 2));
-  hideLoading();
+  return { rows, cols, pixelData, slope, intercept, instance, zPos, samplesPerPixel };
 }
 
-// ─── Main ──────────────────────────────────────────────────────────
-(async function main() {
+// ─── Render con windowing ─────────────────────────────────────────
+function renderCurrent() {
+  if (!state.slices.length || !state.canvas) return;
+  const s = state.slices[state.currentIdx];
+  const { rows, cols, pixelData, slope, intercept } = s;
+  const { ww, wc } = PRESETS[state.presetIdx];
+  const lower = wc - ww / 2;
+
+  // Resize canvas a las dimensiones del slice solo si cambia.
+  if (state.canvas.width !== cols || state.canvas.height !== rows) {
+    state.canvas.width = cols;
+    state.canvas.height = rows;
+  }
+  const imageData = state.ctx.createImageData(cols, rows);
+  const out = imageData.data;
+  // Pre-cálculo
+  const invWw = 255 / ww;
+  for (let i = 0; i < pixelData.length; i++) {
+    const hu = pixelData[i] * slope + intercept;
+    let v = (hu - lower) * invWw;
+    if (v < 0) v = 0;
+    else if (v > 255) v = 255;
+    else v = v | 0;
+    const j = i * 4;
+    out[j] = v;
+    out[j + 1] = v;
+    out[j + 2] = v;
+    out[j + 3] = 255;
+  }
+  state.ctx.putImageData(imageData, 0, 0);
+}
+
+// ─── Main pipeline ────────────────────────────────────────────────
+async function main() {
   const params = new URLSearchParams(window.location.search);
   if (params.get('return')) $('back-btn').style.display = '';
 
@@ -235,30 +215,82 @@ async function renderFromDicoms(dcmFiles) {
     setError('Falta parámetro ?zip=<URL del zip DICOM>');
     return;
   }
-
-  // Sanity check de que las libs cargaron desde CDN.
-  const missing = [];
-  if (typeof JSZip === 'undefined') missing.push('JSZip');
-  if (typeof dicomParser === 'undefined') missing.push('dicomParser');
-  if (typeof cornerstone === 'undefined') missing.push('cornerstone');
-  // El loader expone window.cornerstoneWADOImageLoader.
-  if (typeof cornerstoneWADOImageLoader === 'undefined') missing.push('cornerstoneWADOImageLoader');
-  if (missing.length) {
-    const globals = Object.keys(window).filter((k) =>
-      /cornerstone|dicom|jszip/i.test(k)).join(', ') || '(ninguno)';
-    setError(
-      `No cargaron: ${missing.join(', ')}`,
-      `Globals presentes que matchean: ${globals}\n\nProbá hard-refresh o avisame si el CDN está caído.`,
-    );
+  if (typeof JSZip === 'undefined') {
+    setError('JSZip no cargó');
+    return;
+  }
+  if (typeof dicomParser === 'undefined') {
+    setError('dicomParser no cargó');
     return;
   }
 
   try {
     const zipBlob = await downloadZip(zipUrl);
-    const dcmFiles = await extractDicoms(zipBlob);
-    await renderFromDicoms(dcmFiles);
+    const dcmBuffers = await extractDicoms(zipBlob);
+
+    setLoading('Parseando DICOMs…', 72, '');
+    const slices = [];
+    let skipped = 0;
+    for (let i = 0; i < dcmBuffers.length; i++) {
+      try {
+        slices.push(parseSlice(dcmBuffers[i].buf));
+      } catch (e) {
+        skipped++;
+      }
+      if (i % 10 === 0) {
+        const pct = 72 + ((i + 1) / dcmBuffers.length) * 25;
+        setLoading('Parseando DICOMs…', pct, `${i + 1}/${dcmBuffers.length}`);
+      }
+    }
+    if (!slices.length) {
+      throw new Error(`Ningún DICOM tiene pixel data legible (${dcmBuffers.length} probados)`);
+    }
+
+    // Sort por InstanceNumber; fallback a zPos.
+    slices.sort((a, b) => {
+      if (a.instance && b.instance) return a.instance - b.instance;
+      return a.zPos - b.zPos;
+    });
+    state.slices = slices;
+
+    // Canvas setup.
+    state.canvas = $('canvas');
+    state.ctx = state.canvas.getContext('2d');
+
+    // Slider.
+    $('slice-input').max = slices.length - 1;
+    $('slice-input').disabled = false;
+    $('slice-input').addEventListener('input', (e) => setSlice(+e.target.value));
+
+    // Scroll: rueda + swipe vertical.
+    const wrap = document.getElementById('viewport-wrap');
+    wrap.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      setSlice(state.currentIdx + (e.deltaY > 0 ? 1 : -1));
+    }, { passive: false });
+
+    let touchStartY = null;
+    wrap.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1) touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+    wrap.addEventListener('touchmove', (e) => {
+      if (touchStartY == null) return;
+      const dy = touchStartY - e.touches[0].clientY;
+      if (Math.abs(dy) > 12) {
+        setSlice(state.currentIdx + Math.sign(dy));
+        touchStartY = e.touches[0].clientY;
+      }
+    }, { passive: true });
+
+    $('preset-btn').style.display = '';
+    $('title').textContent = `DICOM · ${slices.length} cortes${skipped ? ` (${skipped} omitidos)` : ''}`;
+    applyPreset();
+    setSlice(Math.floor(slices.length / 2));
+    hideLoading();
   } catch (e) {
     console.error(e);
     setError(e.message || 'Error desconocido', e.stack || '');
   }
-})();
+}
+
+main();

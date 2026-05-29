@@ -5,14 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
   <title>Visor DICOM</title>
   <link rel="stylesheet" href="style.css" />
-  <!-- Stack legacy cornerstone (classic). Más simple y robusto que
-       cornerstone3D para visualización stack 2D sin bundler. -->
+  <!-- Solo dos deps: JSZip para extraer el zip + dicom-parser para leer
+       headers DICOM. Renderizamos a canvas con código propio, sin
+       cornerstone (que dio problemas con el bundle del CDN). -->
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dicom-parser@1.8.21/dist/dicomParser.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/cornerstone-core@2.6.1/dist/cornerstone.min.js"></script>
-  <!-- 3.4.3: última versión de la rama 3.x que publica el bundle UMD
-       all-in-one (.bundle.min.js). A partir de 4.x el bundle se rompió. -->
-  <script src="https://cdn.jsdelivr.net/npm/cornerstone-wado-image-loader@3.4.3/dist/cornerstoneWADOImageLoader.bundle.min.js"></script>
 </head>
 <body>
   <div id="app">
@@ -24,7 +21,7 @@
     </div>
 
     <div id="viewport-wrap">
-      <div id="viewport"></div>
+      <canvas id="canvas"></canvas>
       <div id="overlay">
         <div id="slice-label">— / —</div>
         <div id="wl-label"></div>
