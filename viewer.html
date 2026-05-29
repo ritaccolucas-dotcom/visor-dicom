@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Visor DICOM</title>
+  <link rel="stylesheet" href="style.css" />
+  <!-- Cornerstone3D y dependencias vía CDN. JSZip para extraer el zip. -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="https://unpkg.com/dicom-parser@1.8.21/dist/dicomParser.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <button id="back-btn" class="tb-btn" onclick="goBack()" style="display:none;">← Dashboard</button>
+      <span id="title">Cargando DICOM…</span>
+      <span id="meta"></span>
+      <button class="tb-btn" id="preset-btn" onclick="cyclePreset()" style="display:none;">Bone</button>
+    </div>
+
+    <div id="viewport-wrap">
+      <div id="viewport"></div>
+      <div id="overlay">
+        <div id="slice-label">— / —</div>
+        <div id="wl-label"></div>
+      </div>
+      <div id="loading">
+        <div class="spinner"></div>
+        <div id="loading-text">Descargando zip…</div>
+        <div id="loading-bar-wrap"><div id="loading-bar"></div></div>
+        <div id="loading-detail"></div>
+      </div>
+    </div>
+
+    <div id="slice-bar">
+      <input id="slice-input" type="range" min="0" max="0" value="0" step="1" disabled />
+    </div>
+  </div>
+
+  <!-- Cornerstone3D — viene como ESM, lo carga viewer.js -->
+  <script type="module" src="viewer.js"></script>
+</body>
+</html>
