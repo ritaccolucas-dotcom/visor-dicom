@@ -77,7 +77,9 @@ function setSlice(idx) {
 // ─── Drive zip download with progress ─────────────────────────────
 async function downloadZip(url) {
   setLoading('Descargando zip…', 5, '');
-  const res = await fetch(url, { credentials: 'include' });
+  // Sin credentials: el URL ya viene firmado con HMAC, no necesitamos
+  // cookies (que ni se mandarían por ser cross-origin igual).
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`Descarga falló: HTTP ${res.status}`);
   const total = +res.headers.get('Content-Length') || 0;
   const reader = res.body.getReader();
