@@ -74,11 +74,9 @@ function setSlice(idx) {
   renderCurrent();
 }
 
-// ─── Drive zip download with progress ─────────────────────────────
-async function downloadZip(url) {
-  // Mostramos el URL en el detail mientras intenta — para diagnosticar
-  // si pega al endpoint correcto.
-  setLoading('Descargando zip…', 5, url.length > 90 ? url.slice(0, 90) + '…' : url);
+// ─── Source fetch: zip OR folder manifest ─────────────────────────
+async function fetchSource(url) {
+  setLoading('Consultando manifest…', 3, '');
   let res;
   try {
     res = await fetch(url);
@@ -89,6 +87,12 @@ async function downloadZip(url) {
     const body = await res.text().catch(() => '');
     throw new Error(`HTTP ${res.status} ${res.statusText}\nURL: ${url}\n\n${body.slice(0, 300)}`);
   }
+  const ct = res.headers.get('Content-Type') || '';
+  if (ct.includes('application/json')) {
+    const manifest = await res.json();
+    return { kind: 'folder', manifest };
+  }
+  // Modo zip: stream con progress.
   const total = +res.headers.get('Content-Length') || 0;
   const reader = res.body.getReader();
   const chunks = [];
@@ -103,7 +107,45 @@ async function downloadZip(url) {
     const totalMb = total ? ` / ${(total / 1024 / 1024).toFixed(0)} MB` : '';
     setLoading('Descargando zip…', pct, `${mb} MB${totalMb}`);
   }
-  return new Blob(chunks);
+  return { kind: 'zip', blob: new Blob(chunks) };
+}
+
+// Folder mode: bajamos cada DICOM individualmente, en paralelo (8 a la vez).
+async function downloadFolderItems(items, baseUrl) {
+  const dcmBuffers = [];
+  let done = 0;
+  const total = items.length;
+  setLoading(`Descargando ${total} archivos…`, 5, `0/${total}`);
+
+  const CONCURRENCY = 8;
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      const item = items[i];
+      try {
+        const res = await fetch(`${baseUrl}&file=${encodeURIComponent(item.id)}`);
+        if (!res.ok) continue;
+        const buf = await res.arrayBuffer();
+        // Magic check antes de agregar.
+        if (buf.byteLength > 132) {
+          const sig = String.fromCharCode(...new Uint8Array(buf, 128, 4));
+          if (sig === 'DICM') dcmBuffers.push({ name: item.name, buf });
+        }
+      } catch { /* skip */ }
+      done++;
+      if (done % 5 === 0 || done === total) {
+        const pct = 5 + (done / total) * 60;
+        setLoading(`Descargando ${total} archivos…`, pct, `${done}/${total} · ${dcmBuffers.length} DICOM`);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  if (!dcmBuffers.length) {
+    throw new Error(`Ningún archivo es DICOM (revisados ${total})`);
+  }
+  return dcmBuffers;
 }
 
 // ─── Unzip + collect DICOM (magic-checked) ────────────────────────
@@ -235,8 +277,19 @@ async function main() {
   }
 
   try {
-    const zipBlob = await downloadZip(zipUrl);
-    const dcmBuffers = await extractDicoms(zipBlob);
+    const source = await fetchSource(zipUrl);
+    let dcmBuffers;
+    if (source.kind === 'folder') {
+      const { manifest } = source;
+      setLoading('Manifest recibido', 4,
+        `${manifest.items?.length || 0} candidatos en carpeta`);
+      if (!manifest.items?.length) {
+        throw new Error(`La carpeta no tiene archivos DICOM (revisados ${manifest.total_found})`);
+      }
+      dcmBuffers = await downloadFolderItems(manifest.items, zipUrl);
+    } else {
+      dcmBuffers = await extractDicoms(source.blob);
+    }
 
     setLoading('Parseando DICOMs…', 72, '');
     const slices = [];
