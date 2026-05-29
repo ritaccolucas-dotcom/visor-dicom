@@ -5,9 +5,15 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
   <title>Visor DICOM</title>
   <link rel="stylesheet" href="style.css" />
-  <!-- Cornerstone3D y dependencias vía CDN. JSZip para extraer el zip. -->
+  <!-- Stack legacy cornerstone (classic). Más simple y robusto que
+       cornerstone3D para visualización stack 2D sin bundler. -->
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="https://unpkg.com/dicom-parser@1.8.21/dist/dicomParser.min.js"></script>
+  <script src="https://unpkg.com/hammerjs@2.0.8/hammer.min.js"></script>
+  <script src="https://unpkg.com/cornerstone-core@2.6.1/dist/cornerstone.min.js"></script>
+  <script src="https://unpkg.com/cornerstone-math@0.1.10/dist/cornerstoneMath.min.js"></script>
+  <script src="https://unpkg.com/cornerstone-tools@6.0.10/dist/cornerstoneTools.min.js"></script>
+  <script src="https://unpkg.com/cornerstone-wado-image-loader@4.13.3/dist/cornerstoneWADOImageLoader.bundle.min.js"></script>
 </head>
 <body>
   <div id="app">
@@ -26,7 +32,7 @@
       </div>
       <div id="loading">
         <div class="spinner"></div>
-        <div id="loading-text">Descargando zip…</div>
+        <div id="loading-text">Iniciando…</div>
         <div id="loading-bar-wrap"><div id="loading-bar"></div></div>
         <div id="loading-detail"></div>
       </div>
@@ -37,7 +43,6 @@
     </div>
   </div>
 
-  <!-- Cornerstone3D — viene como ESM, lo carga viewer.js -->
-  <script type="module" src="viewer.js"></script>
+  <script src="viewer.js"></script>
 </body>
 </html>
