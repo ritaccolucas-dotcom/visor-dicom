@@ -76,11 +76,19 @@ function setSlice(idx) {
 
 // ─── Drive zip download with progress ─────────────────────────────
 async function downloadZip(url) {
-  setLoading('Descargando zip…', 5, '');
-  // Sin credentials: el URL ya viene firmado con HMAC, no necesitamos
-  // cookies (que ni se mandarían por ser cross-origin igual).
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Descarga falló: HTTP ${res.status}`);
+  // Mostramos el URL en el detail mientras intenta — para diagnosticar
+  // si pega al endpoint correcto.
+  setLoading('Descargando zip…', 5, url.length > 90 ? url.slice(0, 90) + '…' : url);
+  let res;
+  try {
+    res = await fetch(url);
+  } catch (e) {
+    throw new Error(`Fetch network error\nURL: ${url}\n\n${e.message}`);
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} ${res.statusText}\nURL: ${url}\n\n${body.slice(0, 300)}`);
+  }
   const total = +res.headers.get('Content-Length') || 0;
   const reader = res.body.getReader();
   const chunks = [];
