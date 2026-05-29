@@ -237,20 +237,19 @@ async function renderFromDicoms(dcmFiles) {
   }
 
   // Sanity check de que las libs cargaron desde CDN.
-  if (typeof cornerstone === 'undefined') {
-    setError('cornerstone-core no cargó', 'Verificá que el CDN esté disponible.');
-    return;
-  }
-  if (typeof cornerstoneWADOImageLoader === 'undefined') {
-    setError('cornerstoneWADOImageLoader no cargó', '');
-    return;
-  }
-  if (typeof JSZip === 'undefined') {
-    setError('JSZip no cargó', '');
-    return;
-  }
-  if (typeof dicomParser === 'undefined') {
-    setError('dicomParser no cargó', '');
+  const missing = [];
+  if (typeof JSZip === 'undefined') missing.push('JSZip');
+  if (typeof dicomParser === 'undefined') missing.push('dicomParser');
+  if (typeof cornerstone === 'undefined') missing.push('cornerstone');
+  // El loader expone window.cornerstoneWADOImageLoader.
+  if (typeof cornerstoneWADOImageLoader === 'undefined') missing.push('cornerstoneWADOImageLoader');
+  if (missing.length) {
+    const globals = Object.keys(window).filter((k) =>
+      /cornerstone|dicom|jszip/i.test(k)).join(', ') || '(ninguno)';
+    setError(
+      `No cargaron: ${missing.join(', ')}`,
+      `Globals presentes que matchean: ${globals}\n\nProbá hard-refresh o avisame si el CDN está caído.`,
+    );
     return;
   }
 
