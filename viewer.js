@@ -110,12 +110,12 @@ async function fetchSource(url) {
   return { kind: 'zip', blob: new Blob(chunks) };
 }
 
-// Folder mode: bajamos cada DICOM individualmente, en paralelo (8 a la vez).
-async function downloadFolderItems(items, baseUrl) {
-  const dcmBuffers = [];
-  let done = 0;
+// Folder mode con streaming: cada DICOM bajado va al callback onSlice.
+// Quien llama decide si arrancar el viewer cuando hay un mínimo y seguir
+// agregando cortes en background.
+async function downloadFolderItemsStream(items, baseUrl, onSlice, onProgress) {
+  let done = 0, ok = 0;
   const total = items.length;
-  setLoading(`Descargando ${total} archivos…`, 5, `0/${total}`);
 
   const CONCURRENCY = 16;
   let cursor = 0;
@@ -126,26 +126,24 @@ async function downloadFolderItems(items, baseUrl) {
       const item = items[i];
       try {
         const res = await fetch(`${baseUrl}&file=${encodeURIComponent(item.id)}`);
-        if (!res.ok) continue;
-        const buf = await res.arrayBuffer();
-        // Magic check antes de agregar.
-        if (buf.byteLength > 132) {
-          const sig = String.fromCharCode(...new Uint8Array(buf, 128, 4));
-          if (sig === 'DICM') dcmBuffers.push({ name: item.name, buf });
+        if (res.ok) {
+          const buf = await res.arrayBuffer();
+          if (buf.byteLength > 132) {
+            const sig = String.fromCharCode(...new Uint8Array(buf, 128, 4));
+            if (sig === 'DICM') {
+              ok++;
+              onSlice({ name: item.name, buf });
+            }
+          }
         }
       } catch { /* skip */ }
       done++;
-      if (done % 5 === 0 || done === total) {
-        const pct = 5 + (done / total) * 60;
-        setLoading(`Descargando ${total} archivos…`, pct, `${done}/${total} · ${dcmBuffers.length} DICOM`);
-      }
+      onProgress(done, total, ok);
     }
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  if (!dcmBuffers.length) {
-    throw new Error(`Ningún archivo es DICOM (revisados ${total})`);
-  }
-  return dcmBuffers;
+  if (!ok) throw new Error(`Ningún archivo es DICOM (revisados ${total})`);
+  return ok;
 }
 
 // ─── Unzip + collect DICOM (magic-checked) ────────────────────────
@@ -262,6 +260,37 @@ function renderCurrent() {
   state.ctx.putImageData(imageData, 0, 0);
 }
 
+// ─── Series rebuild + bootstrap ───────────────────────────────────
+function rebuildAllSeries() {
+  state.allSeries = Array.from(state.seriesMap.values())
+    .sort((a, b) => b.slices.length - a.slices.length);
+}
+function getTotalAcrossSeries() {
+  return state.allSeries.reduce((acc, s) => acc + s.slices.length, 0);
+}
+function bootstrapViewer() {
+  state.bootstrapped = true;
+  buildSeriesPicker();
+  selectSeries(state.allSeries[0].uid);
+  hideLoading();
+}
+function refreshSeriesPickerLabels() {
+  const picker = document.getElementById('series-picker');
+  if (!picker) return;
+  // Si cambia la cantidad de series, re-construimos.
+  if (picker.options.length !== state.allSeries.length) {
+    buildSeriesPicker();
+    if (state.currentSeriesUID) {
+      document.getElementById('series-picker').value = state.currentSeriesUID;
+    }
+    return;
+  }
+  for (let i = 0; i < state.allSeries.length; i++) {
+    const s = state.allSeries[i];
+    picker.options[i].textContent = `${s.desc || 'Serie'} · ${s.slices.length} cortes`;
+  }
+}
+
 // ─── Series picker ────────────────────────────────────────────────
 function buildSeriesPicker() {
   const topbar = document.getElementById('topbar');
@@ -292,6 +321,7 @@ function selectSeries(uid) {
   const series = state.allSeries.find((s) => s.uid === uid);
   if (!series) return;
   state.slices = series.slices;
+  state.currentSeriesUID = uid;
   state.currentIdx = Math.floor(series.slices.length / 2);
 
   const total = state.allSeries.reduce((acc, s) => acc + s.slices.length, 0);
@@ -326,78 +356,25 @@ async function main() {
 
   try {
     const source = await fetchSource(zipUrl);
-    let dcmBuffers;
-    if (source.kind === 'folder') {
-      const { manifest } = source;
-      setLoading('Manifest recibido', 4,
-        `${manifest.items?.length || 0} candidatos en carpeta`);
-      if (!manifest.items?.length) {
-        throw new Error(`La carpeta no tiene archivos DICOM (revisados ${manifest.total_found})`);
-      }
-      dcmBuffers = await downloadFolderItems(manifest.items, zipUrl);
-    } else {
-      dcmBuffers = await extractDicoms(source.blob);
-    }
 
-    setLoading('Parseando DICOMs…', 72, '');
-    const slices = [];
-    let skipped = 0;
-    for (let i = 0; i < dcmBuffers.length; i++) {
-      try {
-        slices.push(parseSlice(dcmBuffers[i].buf));
-      } catch (e) {
-        skipped++;
-      }
-      if (i % 10 === 0) {
-        const pct = 72 + ((i + 1) / dcmBuffers.length) * 25;
-        setLoading('Parseando DICOMs…', pct, `${i + 1}/${dcmBuffers.length}`);
-      }
-    }
-    if (!slices.length) {
-      throw new Error(`Ningún DICOM tiene pixel data legible (${dcmBuffers.length} probados)`);
-    }
+    // Inicializamos estructuras de series. Se rellenan progresivamente.
+    state.seriesMap = new Map();  // uid → { uid, desc, slices: [] }
+    state.allSeries = [];          // mismo contenido, ordenado por size
+    state.bootstrapped = false;
+    const MIN_TO_BOOTSTRAP = 20;
 
-    // Agrupar por SeriesInstanceUID. Cada serie es un volumen separado;
-    // un CT de cráneo suele venir con 3-8 series (bone window axial, soft
-    // axial, coronal reformat, sagital, etc.). Mostramos una a la vez.
-    const seriesMap = new Map();  // uid → { desc, slices: [] }
-    for (const s of slices) {
-      const e = seriesMap.get(s.seriesUID) || { desc: s.seriesDesc, slices: [] };
-      e.slices.push(s);
-      seriesMap.set(s.seriesUID, e);
-    }
-    // Sort interno por InstanceNumber/zPos.
-    for (const e of seriesMap.values()) {
-      e.slices.sort((a, b) => {
-        if (a.instance && b.instance) return a.instance - b.instance;
-        return a.zPos - b.zPos;
-      });
-    }
-    state.allSeries = Array.from(seriesMap.entries())
-      .map(([uid, e]) => ({ uid, desc: e.desc, slices: e.slices }))
-      .sort((a, b) => b.slices.length - a.slices.length);  // más larga primero
-
-    // Series picker en el topbar (si hay más de una).
-    buildSeriesPicker();
-
-    // Default: la serie más grande (suele ser la reconstrucción principal).
-    selectSeries(state.allSeries[0].uid);
-
-    // Canvas setup.
+    // Canvas + listeners listos desde ya — pero oculto hasta que tengamos algo.
     state.canvas = $('canvas');
     state.ctx = state.canvas.getContext('2d');
-
-    // Slider (max se setea dentro de selectSeries).
     $('slice-input').disabled = false;
     $('slice-input').addEventListener('input', (e) => setSlice(+e.target.value));
 
-    // Scroll: rueda + swipe vertical.
+    // Scroll: rueda + swipe vertical. Activos desde el bootstrap.
     const wrap = document.getElementById('viewport-wrap');
     wrap.addEventListener('wheel', (e) => {
       e.preventDefault();
       setSlice(state.currentIdx + (e.deltaY > 0 ? 1 : -1));
     }, { passive: false });
-
     let touchStartY = null;
     wrap.addEventListener('touchstart', (e) => {
       if (e.touches.length === 1) touchStartY = e.touches[0].clientY;
@@ -411,6 +388,72 @@ async function main() {
       }
     }, { passive: true });
 
+    const ingestBuffer = (buf) => {
+      let slice;
+      try { slice = parseSlice(buf); } catch { return; }
+      let entry = state.seriesMap.get(slice.seriesUID);
+      if (!entry) {
+        entry = { uid: slice.seriesUID, desc: slice.seriesDesc, slices: [] };
+        state.seriesMap.set(slice.seriesUID, entry);
+      }
+      // Insertar manteniendo orden (binary search no aporta a esta escala).
+      entry.slices.push(slice);
+      // Mini-sort puntual al final del array (los DICOMs llegan desordenados).
+      for (let i = entry.slices.length - 1; i > 0; i--) {
+        const a = entry.slices[i - 1], b = entry.slices[i];
+        const cmp = (a.instance && b.instance) ? a.instance - b.instance : a.zPos - b.zPos;
+        if (cmp > 0) { entry.slices[i - 1] = b; entry.slices[i] = a; }
+        else break;
+      }
+      // Actualizar allSeries y bootstrappear si llegamos al threshold.
+      rebuildAllSeries();
+      if (!state.bootstrapped) {
+        const totalSoFar = state.allSeries.reduce((acc, s) => acc + s.slices.length, 0);
+        if (totalSoFar >= MIN_TO_BOOTSTRAP) bootstrapViewer();
+      } else if (state.currentSeriesUID) {
+        // Actualizar slider/contador si crece la serie actual.
+        const cur = state.seriesMap.get(state.currentSeriesUID);
+        if (cur) {
+          $('slice-input').max = cur.slices.length - 1;
+          $('meta').textContent = `${cur.slices.length} cortes`
+            + (state.allSeries.length > 1 ? ` (de ${getTotalAcrossSeries()})` : '');
+        }
+        refreshSeriesPickerLabels();
+      }
+    };
+
+    if (source.kind === 'folder') {
+      const { manifest } = source;
+      if (!manifest.items?.length) {
+        throw new Error(`La carpeta no tiene archivos DICOM (revisados ${manifest.total_found})`);
+      }
+      setLoading(`Descargando ${manifest.items.length} archivos…`, 5,
+        `0/${manifest.items.length}`);
+      await downloadFolderItemsStream(
+        manifest.items, zipUrl,
+        ({ buf }) => ingestBuffer(buf),
+        (done, total, ok) => {
+          if (state.bootstrapped) return;  // ya estamos visualizando
+          if (done % 5 === 0 || done === total) {
+            const pct = 5 + (done / total) * 60;
+            setLoading(`Descargando ${total} archivos…`, pct,
+              `${done}/${total} · ${ok} DICOM`);
+          }
+        },
+      );
+    } else {
+      const dcmBuffers = await extractDicoms(source.blob);
+      setLoading('Parseando DICOMs…', 72, '');
+      for (let i = 0; i < dcmBuffers.length; i++) {
+        ingestBuffer(dcmBuffers[i].buf);
+        if (i % 20 === 0) {
+          const pct = 72 + ((i + 1) / dcmBuffers.length) * 25;
+          setLoading('Parseando DICOMs…', pct, `${i + 1}/${dcmBuffers.length}`);
+        }
+      }
+    }
+
+    if (!state.bootstrapped) bootstrapViewer();  // por si quedaron < MIN
     $('preset-btn').style.display = '';
     applyPreset();
     hideLoading();
