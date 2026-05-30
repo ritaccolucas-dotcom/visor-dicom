@@ -117,7 +117,7 @@ async function downloadFolderItems(items, baseUrl) {
   const total = items.length;
   setLoading(`Descargando ${total} archivos…`, 5, `0/${total}`);
 
-  const CONCURRENCY = 8;
+  const CONCURRENCY = 16;
   let cursor = 0;
   async function worker() {
     while (true) {
@@ -201,6 +201,11 @@ function parseSlice(buf) {
     const parts = position.split('\\');
     if (parts.length === 3) zPos = parseFloat(parts[2]);
   }
+  // SeriesInstanceUID identifica cada serie (axial, coronal, bone window,
+  // soft tissue, etc.). Agrupamos por esto para que el visor muestre una
+  // sola serie a la vez en vez de mezclar 2500 cortes inutilizables.
+  const seriesUID = ds.string('x0020000e') || '__default__';
+  const seriesDesc = ds.string('x0008103e') || ds.string('x00081030') || 'Serie';
 
   const pixelDataElement = ds.elements.x7fe00010;
   if (!pixelDataElement) throw new Error('No tiene PixelData');
@@ -222,7 +227,7 @@ function parseSlice(buf) {
     throw new Error(`bitsAllocated=${bitsAllocated} no soportado`);
   }
 
-  return { rows, cols, pixelData, slope, intercept, instance, zPos, samplesPerPixel };
+  return { rows, cols, pixelData, slope, intercept, instance, zPos, samplesPerPixel, seriesUID, seriesDesc };
 }
 
 // ─── Render con windowing ─────────────────────────────────────────
@@ -255,6 +260,49 @@ function renderCurrent() {
     out[j + 3] = 255;
   }
   state.ctx.putImageData(imageData, 0, 0);
+}
+
+// ─── Series picker ────────────────────────────────────────────────
+function buildSeriesPicker() {
+  const topbar = document.getElementById('topbar');
+  if (!topbar) return;
+  let picker = document.getElementById('series-picker');
+  if (picker) picker.remove();
+
+  if (!state.allSeries || state.allSeries.length < 2) return;
+
+  picker = document.createElement('select');
+  picker.id = 'series-picker';
+  picker.className = 'tb-btn';
+  picker.style.cssText = 'padding:.35rem .6rem;max-width:240px;';
+  for (const s of state.allSeries) {
+    const opt = document.createElement('option');
+    opt.value = s.uid;
+    opt.textContent = `${s.desc || 'Serie'} · ${s.slices.length} cortes`;
+    picker.appendChild(opt);
+  }
+  picker.addEventListener('change', (e) => selectSeries(e.target.value));
+  // Insertar después de #meta.
+  const meta = document.getElementById('meta');
+  if (meta && meta.nextSibling) topbar.insertBefore(picker, meta.nextSibling);
+  else topbar.appendChild(picker);
+}
+
+function selectSeries(uid) {
+  const series = state.allSeries.find((s) => s.uid === uid);
+  if (!series) return;
+  state.slices = series.slices;
+  state.currentIdx = Math.floor(series.slices.length / 2);
+
+  const total = state.allSeries.reduce((acc, s) => acc + s.slices.length, 0);
+  $('title').textContent = `DICOM · ${series.desc || 'Serie'}`;
+  $('meta').textContent = `${series.slices.length} cortes` +
+    (state.allSeries.length > 1 ? ` (de ${total})` : '');
+
+  $('slice-input').max = series.slices.length - 1;
+  setSlice(state.currentIdx);
+  const picker = document.getElementById('series-picker');
+  if (picker) picker.value = uid;
 }
 
 // ─── Main pipeline ────────────────────────────────────────────────
@@ -309,19 +357,37 @@ async function main() {
       throw new Error(`Ningún DICOM tiene pixel data legible (${dcmBuffers.length} probados)`);
     }
 
-    // Sort por InstanceNumber; fallback a zPos.
-    slices.sort((a, b) => {
-      if (a.instance && b.instance) return a.instance - b.instance;
-      return a.zPos - b.zPos;
-    });
-    state.slices = slices;
+    // Agrupar por SeriesInstanceUID. Cada serie es un volumen separado;
+    // un CT de cráneo suele venir con 3-8 series (bone window axial, soft
+    // axial, coronal reformat, sagital, etc.). Mostramos una a la vez.
+    const seriesMap = new Map();  // uid → { desc, slices: [] }
+    for (const s of slices) {
+      const e = seriesMap.get(s.seriesUID) || { desc: s.seriesDesc, slices: [] };
+      e.slices.push(s);
+      seriesMap.set(s.seriesUID, e);
+    }
+    // Sort interno por InstanceNumber/zPos.
+    for (const e of seriesMap.values()) {
+      e.slices.sort((a, b) => {
+        if (a.instance && b.instance) return a.instance - b.instance;
+        return a.zPos - b.zPos;
+      });
+    }
+    state.allSeries = Array.from(seriesMap.entries())
+      .map(([uid, e]) => ({ uid, desc: e.desc, slices: e.slices }))
+      .sort((a, b) => b.slices.length - a.slices.length);  // más larga primero
+
+    // Series picker en el topbar (si hay más de una).
+    buildSeriesPicker();
+
+    // Default: la serie más grande (suele ser la reconstrucción principal).
+    selectSeries(state.allSeries[0].uid);
 
     // Canvas setup.
     state.canvas = $('canvas');
     state.ctx = state.canvas.getContext('2d');
 
-    // Slider.
-    $('slice-input').max = slices.length - 1;
+    // Slider (max se setea dentro de selectSeries).
     $('slice-input').disabled = false;
     $('slice-input').addEventListener('input', (e) => setSlice(+e.target.value));
 
@@ -346,9 +412,7 @@ async function main() {
     }, { passive: true });
 
     $('preset-btn').style.display = '';
-    $('title').textContent = `DICOM · ${slices.length} cortes${skipped ? ` (${skipped} omitidos)` : ''}`;
     applyPreset();
-    setSlice(Math.floor(slices.length / 2));
     hideLoading();
   } catch (e) {
     console.error(e);
