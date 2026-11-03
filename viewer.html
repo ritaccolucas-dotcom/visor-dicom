@@ -17,6 +17,11 @@
       <button id="back-btn" class="tb-btn" onclick="goBack()" style="display:none;">← Dashboard</button>
       <span id="title">Cargando DICOM…</span>
       <span id="meta"></span>
+      <span id="planos" style="display:none;">
+        <button class="tb-btn activo" id="plano-axial"   onclick="setPlano('axial')">Axial</button>
+        <button class="tb-btn"        id="plano-coronal" onclick="setPlano('coronal')">Coronal</button>
+        <button class="tb-btn"        id="plano-sagital" onclick="setPlano('sagital')">Sagital</button>
+      </span>
       <button class="tb-btn" id="preset-btn" onclick="cyclePreset()" style="display:none;">Bone</button>
     </div>
 

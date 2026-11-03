@@ -18,10 +18,17 @@ const PRESETS = [
   { label: 'Lung',         ww: 1500, wc: -600 },
 ];
 
+const PLANOS = [
+  { id: 'axial',    label: 'Axial'    },
+  { id: 'coronal',  label: 'Coronal'  },
+  { id: 'sagital',  label: 'Sagital'  },
+];
+
 const state = {
   presetIdx: 0,
   slices: [],          // array de {rows, cols, pixelData, slope, intercept, instance}
   currentIdx: 0,
+  plane: 'axial',
   canvas: null,
   ctx: null,
 };
@@ -67,9 +74,12 @@ function applyPreset() {
 
 function setSlice(idx) {
   if (!state.slices.length) return;
-  idx = Math.max(0, Math.min(state.slices.length - 1, idx));
+  // El total depende del plano: en coronal recorre filas y en sagital
+  // columnas, no la cantidad de cortes.
+  const total = geomPlano().count;
+  idx = Math.max(0, Math.min(total - 1, idx));
   state.currentIdx = idx;
-  $('slice-label').textContent = `${idx + 1} / ${state.slices.length}`;
+  $('slice-label').textContent = `${idx + 1} / ${total}`;
   $('slice-input').value = idx;
   renderCurrent();
 }
@@ -205,6 +215,20 @@ function parseSlice(buf) {
   const seriesUID = ds.string('x0020000e') || '__default__';
   const seriesDesc = ds.string('x0008103e') || ds.string('x00081030') || 'Serie';
 
+  // PixelSpacing viene como "<entre filas>\<entre columnas>", en mm. Sin esto
+  // las reconstrucciones coronal y sagital salen deformadas, porque la
+  // separación entre cortes casi nunca coincide con el tamaño del píxel
+  // dentro del corte.
+  let rowSpacing = 1, colSpacing = 1;
+  const ps = ds.string('x00280030');
+  if (ps) {
+    const p = ps.split('\\');
+    if (p.length === 2) {
+      rowSpacing = parseFloat(p[0]) || 1;
+      colSpacing = parseFloat(p[1]) || 1;
+    }
+  }
+
   const pixelDataElement = ds.elements.x7fe00010;
   if (!pixelDataElement) throw new Error('No tiene PixelData');
 
@@ -225,40 +249,150 @@ function parseSlice(buf) {
     throw new Error(`bitsAllocated=${bitsAllocated} no soportado`);
   }
 
-  return { rows, cols, pixelData, slope, intercept, instance, zPos, samplesPerPixel, seriesUID, seriesDesc };
+  return { rows, cols, pixelData, slope, intercept, instance, zPos, samplesPerPixel, seriesUID, seriesDesc, rowSpacing, colSpacing };
+}
+
+// ─── Reconstrucción multiplanar (MPR) ─────────────────────────────
+// Coronal y sagital se arman muestreando los mismos cortes en otro eje:
+// no hace falta descargar nada extra ni construir un volumen aparte.
+
+/**
+ * Separación entre cortes, en mm, sacada de las posiciones Z.
+ * Usa la mediana y no el promedio para que un hueco en la serie no
+ * estire toda la reconstrucción.
+ */
+function separacionCortes(slices) {
+  if (slices.length < 2) return 1;
+  const ds = [];
+  for (let i = 1; i < slices.length; i++) {
+    const d = Math.abs(slices[i].zPos - slices[i - 1].zPos);
+    if (d > 1e-4) ds.push(d);
+  }
+  if (!ds.length) return 1;
+  ds.sort((a, b) => a - b);
+  return ds[Math.floor(ds.length / 2)];
+}
+
+const MAX_LADO = 2048;  // techo de seguridad para el canvas
+
+/**
+ * Dimensiones del plano actual, ya corregidas para que el píxel de salida
+ * sea cuadrado. Remuestreamos acá en vez de deformar con CSS: así el canvas
+ * conserva su aspecto real y el `image-rendering: pixelated` sigue siendo
+ * fiel al dato original.
+ */
+function geomPlano() {
+  const s = state.slices[0];
+  const n = state.slices.length;
+  const esp = separacionCortes(state.slices);
+  const alto = (extensionMm, unidadMm) =>
+    Math.max(1, Math.min(MAX_LADO, Math.round(extensionMm / unidadMm)));
+
+  if (state.plane === 'coronal') {
+    // Fijamos una fila; el ancho recorre columnas y el alto recorre cortes.
+    return { count: s.rows, w: s.cols, h: alto(n * esp, s.colSpacing), nz: n };
+  }
+  if (state.plane === 'sagital') {
+    // Fijamos una columna; el ancho recorre filas y el alto recorre cortes.
+    return { count: s.cols, w: s.rows, h: alto(n * esp, s.rowSpacing), nz: n };
+  }
+  return { count: n, w: s.cols, h: alto(s.rows * s.rowSpacing, s.colSpacing), nz: n };
 }
 
 // ─── Render con windowing ─────────────────────────────────────────
 function renderCurrent() {
   if (!state.slices.length || !state.canvas) return;
-  const s = state.slices[state.currentIdx];
-  const { rows, cols, pixelData, slope, intercept } = s;
+  const { w, h, nz } = geomPlano();
   const { ww, wc } = PRESETS[state.presetIdx];
   const lower = wc - ww / 2;
-
-  // Resize canvas a las dimensiones del slice solo si cambia.
-  if (state.canvas.width !== cols || state.canvas.height !== rows) {
-    state.canvas.width = cols;
-    state.canvas.height = rows;
-  }
-  const imageData = state.ctx.createImageData(cols, rows);
-  const out = imageData.data;
-  // Pre-cálculo
   const invWw = 255 / ww;
-  for (let i = 0; i < pixelData.length; i++) {
-    const hu = pixelData[i] * slope + intercept;
-    let v = (hu - lower) * invWw;
-    if (v < 0) v = 0;
-    else if (v > 255) v = 255;
-    else v = v | 0;
-    const j = i * 4;
-    out[j] = v;
-    out[j + 1] = v;
-    out[j + 2] = v;
-    out[j + 3] = 255;
+  const idx = state.currentIdx;
+  const slices = state.slices;
+
+  if (state.canvas.width !== w || state.canvas.height !== h) {
+    state.canvas.width = w;
+    state.canvas.height = h;
+  }
+  const imageData = state.ctx.createImageData(w, h);
+  const out = imageData.data;
+
+  // Z de la fila de pantalla v. Se invierte para que la cabeza quede
+  // arriba: los cortes están ordenados con Z creciente.
+  const zDe = (v) => {
+    const z = Math.round((h - 1 - v) * (nz - 1) / Math.max(1, h - 1));
+    return z < 0 ? 0 : (z >= nz ? nz - 1 : z);
+  };
+
+  // El plano se decide una vez y no por píxel: son cientos de miles de
+  // iteraciones y la rama adentro del bucle se nota.
+  let j = 0;
+  if (state.plane === 'axial') {
+    const s = slices[idx];
+    const { pixelData, slope, intercept, cols, rows } = s;
+    for (let v = 0; v < h; v++) {
+      const y = Math.min(rows - 1, Math.round(v * (rows - 1) / Math.max(1, h - 1)));
+      const fila = y * cols;
+      for (let u = 0; u < w; u++) {
+        let g = (pixelData[fila + u] * slope + intercept - lower) * invWw;
+        g = g < 0 ? 0 : g > 255 ? 255 : g | 0;
+        out[j] = out[j + 1] = out[j + 2] = g; out[j + 3] = 255; j += 4;
+      }
+    }
+  } else if (state.plane === 'coronal') {
+    for (let v = 0; v < h; v++) {
+      const s = slices[zDe(v)];
+      const fila = idx * s.cols;
+      const { pixelData, slope, intercept } = s;
+      for (let u = 0; u < w; u++) {
+        let g = (pixelData[fila + u] * slope + intercept - lower) * invWw;
+        g = g < 0 ? 0 : g > 255 ? 255 : g | 0;
+        out[j] = out[j + 1] = out[j + 2] = g; out[j + 3] = 255; j += 4;
+      }
+    }
+  } else {
+    for (let v = 0; v < h; v++) {
+      const s = slices[zDe(v)];
+      const { pixelData, slope, intercept, cols } = s;
+      for (let u = 0; u < w; u++) {
+        let g = (pixelData[u * cols + idx] * slope + intercept - lower) * invWw;
+        g = g < 0 ? 0 : g > 255 ? 255 : g | 0;
+        out[j] = out[j + 1] = out[j + 2] = g; out[j + 3] = 255; j += 4;
+      }
+    }
   }
   state.ctx.putImageData(imageData, 0, 0);
 }
+
+/**
+ * Muestra el selector de plano y marca el activo.
+ *
+ * Con menos de 3 cortes no hay volumen que reconstruir, así que coronal y
+ * sagital quedan ocultos en vez de ofrecer una imagen de una o dos líneas.
+ */
+function mostrarBotonesDePlano(slices) {
+  const reconstruible = slices.length >= 3;
+  for (const p of PLANOS) {
+    const b = $(`plano-${p.id}`);
+    if (!b) continue;
+    b.style.display = (p.id === 'axial' || reconstruible) ? '' : 'none';
+    b.classList.toggle('activo', p.id === state.plane);
+  }
+  const grupo = $('planos');
+  if (grupo) grupo.style.display = reconstruible ? '' : 'none';
+}
+
+window.setPlano = function (id) {
+  if (state.plane === id || !state.slices.length) return;
+  state.plane = id;
+  for (const p of PLANOS) {
+    const b = $(`plano-${p.id}`);
+    if (b) b.classList.toggle('activo', p.id === id);
+  }
+  // Arrancamos al medio: en coronal y sagital los extremos suelen ser aire.
+  const { count } = geomPlano();
+  $('slice-input').max = count - 1;
+  setSlice(Math.floor(count / 2));
+};
 
 // ─── Series rebuild + bootstrap ───────────────────────────────────
 function rebuildAllSeries() {
@@ -322,15 +456,19 @@ function selectSeries(uid) {
   if (!series) return;
   state.slices = series.slices;
   state.currentSeriesUID = uid;
-  state.currentIdx = Math.floor(series.slices.length / 2);
+  // Al cambiar de serie volvemos a axial: el plano anterior pudo quedar
+  // sin sentido si la serie nueva tiene otra geometría.
+  state.plane = 'axial';
 
   const total = state.allSeries.reduce((acc, s) => acc + s.slices.length, 0);
   $('title').textContent = `DICOM · ${series.desc || 'Serie'}`;
   $('meta').textContent = `${series.slices.length} cortes` +
     (state.allSeries.length > 1 ? ` (de ${total})` : '');
 
-  $('slice-input').max = series.slices.length - 1;
-  setSlice(state.currentIdx);
+  mostrarBotonesDePlano(series.slices);
+  const { count } = geomPlano();
+  $('slice-input').max = count - 1;
+  setSlice(Math.floor(count / 2));
   const picker = document.getElementById('series-picker');
   if (picker) picker.value = uid;
 }
